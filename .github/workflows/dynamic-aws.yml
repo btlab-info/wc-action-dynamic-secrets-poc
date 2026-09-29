@@ -1,0 +1,56 @@
+# Dynamic AWS credentials from Workload Credentials over GitHub OIDC.
+# No stored secrets: GitHub proves who the workflow is, WC hands back 15-minute AWS creds.
+# This is the step the WC GitHub Action could do for users.
+name: WC dynamic AWS creds (curl)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  SITE: <your-site-id>
+  SVC: <service-name>
+  WC_FOLDER: <folder>
+  WC_NAME: <dynamic-secret-name>
+  AWS_REGION: <aws-region>
+
+jobs:
+  aws:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Get a GitHub OIDC token (the Action already does this).
+      # 2. Ask WC to generate a dynamic secret (the only new call).
+      # 3. Mask the values and set the standard AWS_* variables.
+      - name: Get 15-min AWS creds from Workload Credentials
+        run: |
+          set -euo pipefail
+          JWT=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$SITE" | jq -r '.value')
+
+          B=$(mktemp)
+          C=$(curl -sS -o "$B" -w '%{http_code}' -m 30 -X POST \
+            "https://api.beyondtrust.io/site/$SITE/wlc/dynamic/$WC_NAME/generate?folder=$WC_FOLDER" \
+            -H "Authorization: Bearer $JWT" \
+            -H "X-BT-Service-Name: $SVC" \
+            -H "bt-wlc-api-version: 2026-04-28" \
+            -H "Accept: application/json")
+          [ "$C" = "201" ] || { echo "WC generate -> HTTP $C"; exit 1; }
+
+          AK=$(jq -r .secret.accessKeyId "$B")
+          SK=$(jq -r .secret.secretAccessKey "$B")
+          ST=$(jq -r .secret.sessionToken "$B")
+          echo "expires: $(jq -r .secret.expiration "$B")"
+          rm -f "$B"
+          echo "::add-mask::$AK"; echo "::add-mask::$SK"; echo "::add-mask::$ST"
+          {
+            echo "AWS_ACCESS_KEY_ID=$AK"
+            echo "AWS_SECRET_ACCESS_KEY=$SK"
+            echo "AWS_SESSION_TOKEN=$ST"
+          } >> "$GITHUB_ENV"
+
+      # Any later step just works: AWS CLI, SDKs, Terraform.
+      - name: Use them
+        run: aws sts get-caller-identity --query Arn --output text
